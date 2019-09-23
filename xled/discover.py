@@ -47,24 +47,24 @@ PING_INTERVAL = 1.0
 PEER_EXPIRY = 5.0
 
 
-def xdiscover(find_name=None, destination_host=None, timeout=None):
-    """Generator discover all devices or device of specific name
+def xdiscover(find_id=None, destination_host=None, timeout=None):
+    """Generator discover all devices or device of specific id
 
-    Device can be specified either by name or by host.
+    Device can be specified either by id or by host.
 
-    :param str find_name: (optional) Device name to look for. If not set first node
+    :param str find_id: (optional) Device id to look for. If not set first node
         that responded is returned.
     :param str destination_host: (optional) Ping selected node only.
     :param float timeout: (optional) Number of seconds until discovery timeouts.
-    :return: namedtuple of hardware address, device name and host name.
+    :return: namedtuple of hardware address, device id and host name.
     :rtype: namedtuple
     :raises DiscoverTimeout: timeout exceeded while waiting for a device
     """
-    assert not (find_name and destination_host)
+    assert not (find_id and destination_host)
     receive_timeout = None
     if timeout:
         receive_timeout = timeout / 2
-    hw_address = device_name = ip_address = None
+    hw_address = device_id = ip_address = None
     start = monotonic()
     with DiscoveryInterface(
         destination_host, receive_timeout=receive_timeout
@@ -78,24 +78,26 @@ def xdiscover(find_name=None, destination_host=None, timeout=None):
             event = response.pop(0)
             if event == b"JOINED":
                 assert len(response) == 3
-                hw_address, device_name, ip_address = response
-                if find_name is None or find_name == device_name:
+                hw_address, device_id, ip_address = response
+                if find_id is None or find_id == device_id:
                     if isinstance(hw_address, bytes):
                         hw_address = hw_address.decode("utf-8")
                     if isinstance(ip_address, bytes):
                         ip_address = ip_address.decode("utf-8")
                     DiscoveredDevice = collections.namedtuple(
-                        "DiscoveredDevice", ["hw_address", "name", "ip_address"]
+                        "DiscoveredDevice", ["hw_address", "id", "ip_address"]
                     )
-                    yield DiscoveredDevice(hw_address, device_name, ip_address)
-                    if find_name == device_name:
+                    yield DiscoveredDevice(hw_address, device_id, ip_address)
+                    if find_id == device_id:
                         return
                 else:
                     print(
-                        "Device name {} ({}) joined: {}".format(
-                            device_name, hw_address, ip_address
+                        "Device id {} ({}) joined: {}".format(
+                            device_id, hw_address, ip_address
                         )
                     )
+                if timeout and (monotonic() - start) > timeout:
+                    raise DiscoverTimeout()
             elif event == b"ERROR":
                 print("Error")
                 print("Parameters: {}".format(response))
@@ -106,17 +108,18 @@ def xdiscover(find_name=None, destination_host=None, timeout=None):
                     raise DiscoverTimeout()
                 else:
                     continue
+            elif event == b"ALIVE":
+                if timeout and (monotonic() - start) > timeout:
+                    raise DiscoverTimeout()
             else:
                 print("Unknown event: {}".format(event))
                 print("Parameters: {}".format(response))
 
 
-def discover(find_name=None, destination_host=None, timeout=None):
+def discover(find_id=None, destination_host=None, timeout=None):
     """Wrapper of :py:func:`xdiscover` to return first entry"""
     return next(
-        xdiscover(
-            find_name=find_name, destination_host=destination_host, timeout=timeout
-        )
+        xdiscover(find_id=find_id, destination_host=destination_host, timeout=timeout)
     )
 
 
@@ -259,13 +262,13 @@ def decode_discovery_response(data):
     else:
         ip_address_exploded = ip_address_exploded.encode("utf-8")
 
-    device_name = data[6:-1]
+    device_id = data[6:-1]
     if is_py3:
-        device_name = bytes(device_name)
+        device_id = bytes(device_id)
     else:
-        device_name = device_name.encode("utf-8")
+        device_id = device_id.encode("utf-8")
 
-    return ip_address_exploded, device_name
+    return ip_address_exploded, device_id
 
 
 class Peer(object):
@@ -273,18 +276,18 @@ class Peer(object):
     Each object of this class represents one device on the network
 
     :param hw_address: Hardware (MAC) address of a device.
-    :param device_name: Name of the device.
+    :param device_id: Id of the device.
     :param ip_address: IP address of a device.
     """
 
-    def __init__(self, hw_address, device_name, ip_address):
+    def __init__(self, hw_address, device_id, ip_address):
         self.hw_address = hw_address
         self.ip_address = ip_address
-        self.device_name = device_name
+        self.device_id = device_id
         self.is_alive()
 
     def __repr__(self):
-        return "Peer({0!r})".format(self.hw_address, self.device_name)
+        return "Peer({0!r})".format(self.hw_address, self.device_id)
 
     def is_alive(self):
         """
@@ -328,17 +331,25 @@ class InterfaceAgent(object):
         #: Hash of known peers, fast lookup
         self.peers = {}
 
+    def _close(self):
+        log.debug("Stopping periodic ping.")
+        self.periodic_ping.stop()
+        log.debug("Removing beacon handler.")
+        self.loop.remove_handler(self.udp.handle.fileno())
+        log.debug("Closing UDP client.")
+        self.loop.add_callback(self.udp.close)
+        log.debug("Stopping loop from agent")
+        self.loop.add_callback(self.loop.stop)
+
     def stop(self):
         """
         Stop the loop of agent
         """
-        self.loop.add_callback(self.udp.close)
-        self.loop.add_callback(self.loop.stop)
+        self._close()
 
     def __del__(self):
         try:
-            self.loop.add_callback(self.udp.close)
-            self.loop.add_callback(self.loop.stop)
+            self._close()
         except Exception:
             pass
 
@@ -356,10 +367,12 @@ class InterfaceAgent(object):
         )
         stream = ZMQStream(self.pipe, self.loop)
         stream.on_recv(self.control_message)
-        pc = PeriodicCallback(self.send_ping, PING_INTERVAL * 1000)
-        pc.start()
-        pc = PeriodicCallback(self.reap_peers, PING_INTERVAL * 1000)
-        pc.start()
+        self.periodic_ping = PeriodicCallback(self.send_ping, PING_INTERVAL * 1000)
+        self.periodic_ping.start()
+        self.periodic_reap_peers = PeriodicCallback(
+            self.reap_peers, PING_INTERVAL * 1000
+        )
+        self.periodic_reap_peers.start()
         log.debug("Starting Loop")
         self.loop.start()
         log.debug("Loop ended")
@@ -406,9 +419,8 @@ class InterfaceAgent(object):
             self.pipe.send_multipart(
                 [b"ERROR", b"Failed to send a message to main thread."]
             )
-            raise
-        finally:
             self.stop()
+            raise
 
     def _next_packet(self):
         """
@@ -417,15 +429,7 @@ class InterfaceAgent(object):
         :return: tuple received data, hostname
         """
         while True:
-            try:
-                data, host = self.udp.recv(64)
-            except ReceiveTimeout:
-                msg_parts = [b"RECEIVE_TIMEOUT"]
-                try:
-                    self._send_to_pipe_multipart(msg_parts)
-                except Exception:
-                    return
-                continue
+            data, host = self.udp.recv(64)
             return data, host
 
     def handle_beacon(self, fd, event):
@@ -439,12 +443,20 @@ class InterfaceAgent(object):
         :param event: not used
         """
         log.debug("Waiting for a beacon.")
-        data, host = self._next_packet()
+        try:
+            data, host = self._next_packet()
+        except ReceiveTimeout:
+            msg_parts = [b"RECEIVE_TIMEOUT"]
+            try:
+                self._send_to_pipe_multipart(msg_parts)
+            except Exception:
+                return
+            return
         if data == PING_MESSAGE:
             log.debug("Ignoring ping message received from network from %s.", host)
             return
         log.debug("Received a beacon from %s.", host)
-        ip_address, device_name = decode_discovery_response(data)
+        ip_address, device_id = decode_discovery_response(data)
         # if host != ip_address:
         # print("Host {} != ip_address {}".format(host, ip_address))
         log.debug("Getting hardware address of %s.", ip_address)
@@ -453,7 +465,7 @@ class InterfaceAgent(object):
             hw_address = bytes(hw_address, "utf-8")
         if hw_address is None:
             log.error("Unable to get HW adress of %s.", ip_address)
-            msg_parts = [b"ERROR", device_name, ip_address]
+            msg_parts = [b"ERROR", device_id, ip_address]
             try:
                 self._send_to_pipe_multipart(msg_parts)
             except Exception:
@@ -462,10 +474,10 @@ class InterfaceAgent(object):
         if hw_address in self.peers:
             log.debug("Peer %s seen before.", hw_address)
             self.peers[hw_address].is_alive()
-            if device_name != self.peers[hw_address].device_name:
-                old_device_name = self.peers[hw_address].device_name
-                self.peers[hw_address].device_name = device_name
-                msg_parts = [b"RENAMED", hw_address, old_device_name, device_name]
+            if device_id != self.peers[hw_address].device_id:
+                old_device_id = self.peers[hw_address].device_id
+                self.peers[hw_address].device_id = device_id
+                msg_parts = [b"RENAMED", hw_address, old_device_id, device_id]
                 try:
                     self._send_to_pipe_multipart(msg_parts)
                 except Exception:
@@ -478,10 +490,15 @@ class InterfaceAgent(object):
                     self._send_to_pipe_multipart(msg_parts)
                 except Exception:
                     return
+            msg_parts = [b"ALIVE", hw_address, device_id, ip_address]
+            try:
+                self._send_to_pipe_multipart(msg_parts)
+            except Exception:
+                return
         else:
             log.debug("Never seen %s before.", hw_address)
-            self.peers[hw_address] = Peer(hw_address, device_name, ip_address)
-            msg_parts = [b"JOINED", hw_address, device_name, ip_address]
+            self.peers[hw_address] = Peer(hw_address, device_id, ip_address)
+            msg_parts = [b"JOINED", hw_address, device_id, ip_address]
             try:
                 self._send_to_pipe_multipart(msg_parts)
             except Exception:
